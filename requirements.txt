@@ -1,0 +1,40 @@
+# ──────────────────────────────────────────────
+# Core framework
+# ──────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.7.0
+pydantic-settings>=2.2.0
+python-multipart>=0.0.9        # for UploadFile support
+
+# ──────────────────────────────────────────────
+# Computer Vision & ML
+# ──────────────────────────────────────────────
+ultralytics>=8.2.0
+opencv-python-headless>=4.9.0  # headless = no GUI deps (server safe)
+numpy>=1.26.0
+easyocr>=1.7.0
+
+# ──────────────────────────────────────────────
+# PDF Processing
+# ──────────────────────────────────────────────
+PyMuPDF>=1.24.0
+
+# ──────────────────────────────────────────────
+# Development / Testing
+# ──────────────────────────────────────────────
+pytest>=8.1.0
+httpx>=0.27.0                  # for FastAPI TestClient
+
+# ──────────────────────────────────────────────
+# Safety & Observability (Batch 2)
+# ──────────────────────────────────────────────
+slowapi>=0.1.9                 # per-IP rate limiting
+psutil>=5.9.0                  # memory usage monitoring in perf stats
+
+# ──────────────────────────────────────────────
+# Distributed Job Queue (Batch 3)
+# ──────────────────────────────────────────────
+redis>=5.0.0                   # async Redis client (redis.asyncio) + sync client for Celery tasks
+celery>=5.4.0                  # distributed task queue
+

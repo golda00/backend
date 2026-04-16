@@ -1,0 +1,34 @@
+# Storage — job uploads and generated outputs (mounted as volumes in production)
+storage/
+!storage/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.whl
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment secrets
+.env
+
+# Model weights (large binaries — store in DVC or object storage)
+model_weights/
+
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
