@@ -191,6 +191,8 @@ def run_fiber_after_pipeline(job_id: str, store: Any, settings: Settings):
         zoom = dpi / 72.0
 
         def _sync_update(data: dict):
+            if "message" in data:
+                logger.info(f"[{job_id}] [{data.get('progress', 0.0):.0f}%] {data['message']}")
             job.update(data)
             # Handle both Store object (Celery) and dict stub (Local threading)
             if hasattr(store, 'set_sync'):
@@ -228,7 +230,11 @@ def run_fiber_after_pipeline(job_id: str, store: Any, settings: Settings):
             flagged_tiles = []
             all_callout_records = []
             
+            num_results = len(results)
             for i, r in enumerate(results):
+                if i % 5 == 0 or i == num_results - 1:
+                     _sync_update({"progress": 60.0 + (i / num_results * 20.0), "message": f"Processing detection {i+1}/{num_results}..."})
+                
                 bbox = r["bbox"]
                 cx, cy = (bbox[0] + bbox[2])/2, (bbox[1] + bbox[3])/2
                 
@@ -251,19 +257,22 @@ def run_fiber_after_pipeline(job_id: str, store: Any, settings: Settings):
                 hub_val = str(title_box.get("hub", "")).upper()
                 port_val = str(title_box.get("port_panel", "")).upper()
 
-                # User requirement: 2 separate callouts placed separately PER symbol
-                callout_data = [] # List of (text, y_offset)
+                # 2 callouts per symbol, encoded as GLOBAL image coords (gx/gy)
+                callout_data = []  # list of (text, y_offset)
 
+                callouts = r.get("callouts", {})
                 if "SPLICE CAN" in cls or "SPLICE_CAN" in cls:
-                    callout_data = [
-                        ("SPLICE #2", -20),
-                        ("MUX LOCATION", 20)
-                    ]
+                    txt2 = callouts.get("splice2", "SPLICE #2")
+                    callout_data = [(txt2, -20)]
+                    if job.get("include_mux", True):
+                        txt_mux = callouts.get("mux", "MUX LOCATION")
+                        callout_data.append((txt_mux, 20))
                 elif "NODE" in cls:
-                    node_detail = f"HUB: {hub_val}\nPORT/PANEL:: {port_val}"
+                    txt1 = callouts.get("splice1", "SPLICE #1")
+                    node_detail = f"HUB: {hub_val}\nPORT/PANEL: {port_val}"
                     callout_data = [
-                        ("SPLICE #1", -22),
-                        (node_detail, 22)
+                        (txt1, -22),
+                        (node_detail, 22),
                     ]
                 else:
                     callout_data = [(cls, 0)]
@@ -271,13 +280,13 @@ def run_fiber_after_pipeline(job_id: str, store: Any, settings: Settings):
                 for txt, y_off in callout_data:
                     all_callout_records.append({
                         "tile_idx": tile_idx,
-                        "lx": cx - tx1,
+                        "gx": cx,           # global image x
+                        "gy": cy + y_off,   # global image y (with offset)
+                        "lx": cx - tx1,     # kept for compat
                         "ly": (cy - ty1) + y_off,
-                        "gx": cx,
-                        "gy": cy + y_off,
-                        "text": txt
+                        "text": txt,
                     })
-                
+
                 flagged_tiles.append(tile_idx)
 
             # Store detection state
@@ -307,8 +316,13 @@ def run_fiber_after_pipeline(job_id: str, store: Any, settings: Settings):
             # Create a lookup for overrides: tileIdx -> override_dict
             override_map = {o["tileIdx"]: o for o in overrides if "tileIdx" in o}
             
+            # Respect include_mux flag: strip MUX LOCATION if user chose No
+            include_mux = job.get("include_mux", True)
+
             final_callout_records = []
             for rec in initial_records:
+                if not include_mux and rec.get("text", "").upper().strip() == "MUX LOCATION":
+                    continue  # Skip MUX LOCATION callout
                 t_idx = rec.get("tile_idx")
                 if t_idx in override_map:
                     ovr = override_map[t_idx]
@@ -331,25 +345,27 @@ def run_fiber_after_pipeline(job_id: str, store: Any, settings: Settings):
             generate_vector_report(
                 after_pdf_path=pdf_path,
                 callout_records=final_callout_records,
-                tile_offsets=tile_offsets,
-                W_inv=W_inv,
+                tile_offsets={int(k): v for k, v in job.get("tile_offsets_fiber", {}).items()},
+                W_inv=np.eye(3, dtype=np.float32),
                 output_path=report_path,
                 dpi=dpi,
                 survey_image_path=job.get("survey_image_path"),
                 title_box_data={
-                    "prism_id": job.get("title_box", {}).get("prism_id", ""),
-                    "node_name": job.get("title_box", {}).get("node_name", ""),
-                    "instance": job.get("title_box", {}).get("instance", ""),
-                    "map_type": "FIBER AFTER",
+                    "prism_id":   job.get("title_box", {}).get("prism_id", ""),
+                    "node_name":  job.get("title_box", {}).get("node_name", ""),
+                    "instance":   job.get("title_box", {}).get("instance", ""),
+                    "map_type":   "FIBER AFTER",
+                    "page_count": 1,
                 },
                 title_font_size=34,
-                include_legend=False  # Disable legend as requested
+                include_legend=False,
             )
 
             _sync_update({
                 "status": JobStatus.COMPLETED,
                 "progress": 100.0,
                 "message": "Success! Fiber map generated with 34pt title box.",
+                "callouts": final_callout_records,
                 "report_path": Path(report_path).relative_to(settings.BASE_DIR).as_posix()
             })
 

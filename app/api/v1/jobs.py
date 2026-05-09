@@ -124,7 +124,7 @@ async def submit_coax_before_job(
 
     # Dispatch Celery task with local fallback for coax before
     try:
-        run_coax_before_task.delay(job_id)
+        run_coax_before_task.apply_async(args=[job_id], kwargs={"job_data": _serialize_for_celery(job_record)})
     except Exception as celery_err:
         import asyncio
         from app.services.coax_before import run_coax_before_pipeline
@@ -222,7 +222,7 @@ async def submit_fiber_overview_job(
     await store.set(job_id, job_record)
     # Dispatch Celery task with local thread pool fallback
     try:
-        run_fiber_overview_task.delay(job_id)
+        run_fiber_overview_task.apply_async(args=[job_id], kwargs={"job_data": _serialize_for_celery(job_record)})
         logger.info(f"[{job_id}] Dispatched Fiber Overview to Celery worker.")
     except Exception as celery_err:
         logger.warning(f"[{job_id}] Celery unavailable ({celery_err}). Falling back to local thread pool executor.")
@@ -327,7 +327,7 @@ async def submit_fiber_overview_before_job(
     
     # Dispatch Celery task with local thread pool fallback
     try:
-        run_fiber_before_task.delay(job_id)
+        run_fiber_before_task.apply_async(args=[job_id], kwargs={"job_data": _serialize_for_celery(job_record)})
         logger.info(f"[{job_id}] Dispatched Fiber Before to Celery worker.")
     except Exception as celery_err:
         logger.warning(f"[{job_id}] Celery unavailable ({celery_err}). Falling back to local threads.")
@@ -378,6 +378,7 @@ async def submit_fiber_after_job(
     hub: Annotated[str, Form(description="Hub Name")] = "",
     port_panel: Annotated[str, Form(description="Port/Panel Detail")] = "",
     dpi: Annotated[int, Form(description="Rendering DPI (50, 70, or 90)")] = 50,
+    include_mux: Annotated[bool, Form(description="Whether to include MUX LOCATION callout in output PDF")] = True,
     settings: Settings = Depends(get_settings),
 ) -> JobCreatedResponse:
     _validate_pdf(file)
@@ -421,11 +422,12 @@ async def submit_fiber_after_job(
         "created_at": time.time(),
         "stage_times": {},
         "pipeline_type": "fiber_after",
+        "include_mux": include_mux,
     }
     await store.set(job_id, job_record)
     
     try:
-        run_fiber_after_task.delay(job_id)
+        run_fiber_after_task.apply_async(args=[job_id], kwargs={"job_data": _serialize_for_celery(job_record)})
         logger.info(f"[{job_id}] Dispatched Fiber After to Celery worker.")
     except Exception as celery_err:
         logger.warning(f"[{job_id}] Celery unavailable. Falling back to local thread pool.")
@@ -522,7 +524,7 @@ async def submit_job(
         "after_path":   str(after_path),
         "output_dir":   str(settings.OUTPUTS_DIR / job_id),
         "dpi":          dpi,
-        "survey_image": survey_image_path,
+        "survey_image_path": survey_image_path,
         "title_box": {
             "prism_id": prism_id,
             "map_type": map_type,
@@ -549,7 +551,7 @@ async def submit_job(
     # If Redis / Celery is unavailable, fall back to thread pool executor
     try:
         from app.workers.tasks import run_pipeline_task
-        run_pipeline_task.delay(job_id)
+        run_pipeline_task.apply_async(args=[job_id], kwargs={"job_data": _serialize_for_celery(job_record)})
         logger.info(f"[{job_id}] Dispatched to Celery worker.")
     except Exception as celery_err:
         logger.warning(
@@ -704,9 +706,9 @@ async def perform_job_action(
         
         try:
             if p_type == "fiber_after":
-                run_fiber_after_task.delay(job_id)
+                run_fiber_after_task.apply_async(args=[job_id], kwargs={"job_data": _serialize_for_celery(await store.get(job_id))})
             else:
-                run_pipeline_task.delay(job_id)
+                run_pipeline_task.apply_async(args=[job_id], kwargs={"job_data": _serialize_for_celery(await store.get(job_id))})
         except Exception:
             # Local fallback (mirroring submit logic)
             import asyncio
@@ -735,6 +737,7 @@ async def download_result(
     job_id: str,
     request: Request,
     x_job_token: Annotated[str | None, Header(description="Job secret token (X-Job-Token)")] = None,
+    settings: Settings = Depends(get_settings),
 ):
     job = await _get_job_or_404(request, job_id)
     _verify_token(job, x_job_token)
@@ -745,7 +748,7 @@ async def download_result(
             detail="Report not yet available.",
         )
 
-    report_path = Path(job["report_path"])
+    report_path = settings.BASE_DIR / job["report_path"]
     if not report_path.exists():
         raise HTTPException(status_code=404, detail="Report file not found on disk.")
 
@@ -759,6 +762,43 @@ async def download_result(
 # ─────────────────────────────────────────────
 #  Helpers
 # ─────────────────────────────────────────────
+
+def _write_job_sidecar(job_dir: Path, job_record: dict) -> None:
+    """
+    Write a job_record.json next to the uploaded PDFs.
+    This acts as a filesystem fallback so Celery workers can always find job
+    data even when Redis has an async write race condition or is unreachable.
+    """
+    def _default(obj):
+        try:
+            from app.models.schemas import JobStatus
+            if isinstance(obj, JobStatus):
+                return obj.value
+        except Exception:
+            pass
+        return str(obj)
+    try:
+        sidecar_path = Path(job_dir) / "job_record.json"
+        sidecar_path.write_text(_json.dumps(job_record, default=_default), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Could not write job sidecar file: {e}")
+
+
+def _serialize_for_celery(job_record: dict) -> dict:
+    """
+    Convert a job_record dict to a fully JSON-serialisable form
+    so it can travel with the Celery message. This eliminates the
+    need for the worker to look up the job from Redis or any store.
+    """
+    def _default(obj):
+        from app.models.schemas import JobStatus
+        if isinstance(obj, JobStatus):
+            return obj.value
+        if isinstance(obj, Path):
+            return str(obj)
+        return str(obj)
+    return _json.loads(_json.dumps(job_record, default=_default))
+
 
 async def _get_job_or_404(request: Request, job_id: str) -> dict:
     store = _get_store(request)

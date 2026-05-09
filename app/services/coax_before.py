@@ -104,90 +104,111 @@ def _overlay_on_pdf(
         temp_doc.close()
 
     # ── Text box ─────────────────────────────────────────────────
-    text_lines = []
-    if prism_id:
-        text_lines.append(prism_id)
-    if node_name:
-        text_lines.append(node_name)
-    if instance:
-        text_lines.append(instance)
-    text_lines.append(map_type if map_type else "BEFORE PRINT")
-    text_lines.append(f"PG 1 OF {total_pages}")
+    m_type = map_type.upper() if map_type else "BEFORE"
+    print_name = m_type
+    if "AFTER" in m_type:
+        print_name = "AFTER"
+    elif "BEFORE" in m_type:
+        print_name = "BEFORE"
+    elif "SCHEMATIC" in m_type:
+        print_name = "SCHEMATIC REPORT"
+    elif "OVERVIEW" in m_type:
+        print_name = "OVERVIEW"
 
-    text_content = "\n".join(text_lines)
+    text_lines_base = []
+    if prism_id:
+        text_lines_base.append(prism_id)
+    if node_name:
+        text_lines_base.append(node_name)
+    if print_name:
+        text_lines_base.append(print_name)
+    if instance:
+        text_lines_base.append(instance)
+
     font_size = 24
     line_height = font_size + 8
     padding_w, padding_h = 30, 25
 
+    test_lines = text_lines_base.copy()
+    test_lines.append(f"PG {total_pages} OF {total_pages}")
+
     max_line_w = max(
-        (fitz.get_text_length(line, fontname="helv", fontsize=font_size) for line in text_lines),
+        (fitz.get_text_length(line, fontname="helv", fontsize=font_size) for line in test_lines),
         default=100.0,
     )
     text_box_w = max_line_w + padding_w
-    text_box_h = line_height * len(text_lines) + padding_h
+    text_box_h = line_height * (len(text_lines_base) + 1) + padding_h
 
     gap = 10.0
     full_overlay_h = ss_h_pts + text_box_h + gap if ss_h_pts > 0 else text_box_h
-
-    # ── Corner detection ──────────────────────────────────────────
     effective_w = max(ss_w_pts, text_box_w)
-    start_x, start_y, needs_ext = _get_best_corner(
-        page_orig, effective_w, full_overlay_h
-    )
 
-    # ── Handle page extension ─────────────────────────────────────
-    if needs_ext:
-        logger.info("Extending map page upward to create overlay space.")
-        ext_h = full_overlay_h + 100
-        old_rect = page_orig.rect
-        new_height = old_rect.height + ext_h
-
-        new_doc = fitz.open()
-        new_page = new_doc.new_page(width=old_rect.width, height=new_height)
-        new_page.show_pdf_page(
-            fitz.Rect(0, ext_h, old_rect.width, new_height), doc, 0
-        )
-        doc.delete_page(0)
-        doc.insert_pdf(new_doc, from_page=0, to_page=0, start_at=0)
-        new_doc.close()
-
-        page = doc[0]
-        start_x, start_y = 30.0, 50.0
-        is_bottom = False
-    else:
-        page = page_orig
-        is_bottom = start_y > (page.rect.height / 2)
-
-    # ── Define rects ──────────────────────────────────────────────
-    if is_bottom:
-        # Text box on top, image below
-        text_rect = fitz.Rect(start_x, start_y, start_x + text_box_w, start_y + text_box_h)
-        ss_rect = fitz.Rect(
-            start_x, start_y + text_box_h + gap,
-            start_x + ss_w_pts, start_y + text_box_h + gap + ss_h_pts
-        )
-    else:
-        # Image on top (standard), text box below
-        ss_rect = fitz.Rect(start_x, start_y, start_x + ss_w_pts, start_y + ss_h_pts)
-        text_rect = fitz.Rect(
-            start_x, start_y + ss_h_pts + gap,
-            start_x + text_box_w, start_y + ss_h_pts + gap + text_box_h
+    for i in range(total_pages):
+        page_orig = doc[i]
+        start_x, start_y, needs_ext = _get_best_corner(
+            page_orig, effective_w, full_overlay_h
         )
 
-    # ── Draw onto page ────────────────────────────────────────────
-    if screenshot_path and screenshot_path.exists() and ss_h_pts > 0:
-        page.insert_image(ss_rect, filename=str(screenshot_path))
+        if needs_ext:
+            logger.info(f"Extending map page {i+1} upward to create overlay space.")
+            ext_h = full_overlay_h + 100
+            old_rect = page_orig.rect
+            new_height = old_rect.height + ext_h
 
-    # Yellow fill, red border (1.5 pt) — matches all other map types
-    page.draw_rect(text_rect, color=(1, 0, 0), fill=(1, 1, 0), width=1.5)
-    page.insert_textbox(
-        text_rect,
-        text_content,
-        fontsize=font_size,
-        fontname="helv",
-        color=(0, 0, 0),
-        align=0,
-    )
+            new_doc = fitz.open()
+            new_page = new_doc.new_page(width=old_rect.width, height=new_height)
+            new_page.show_pdf_page(
+                fitz.Rect(0, ext_h, old_rect.width, new_height), doc, i
+            )
+            doc.delete_page(i)
+            doc.insert_pdf(new_doc, from_page=0, to_page=0, start_at=i)
+            new_doc.close()
+
+            page = doc[i]
+            start_x, start_y = 30.0, 50.0
+            is_bottom = False
+        else:
+            page = page_orig
+            is_bottom = start_y > (page.rect.height / 2)
+
+        if is_bottom:
+            text_rect = fitz.Rect(start_x, start_y, start_x + text_box_w, start_y + text_box_h)
+            ss_rect = fitz.Rect(
+                start_x, start_y + text_box_h + gap,
+                start_x + ss_w_pts, start_y + text_box_h + gap + ss_h_pts
+            )
+        else:
+            ss_rect = fitz.Rect(start_x, start_y, start_x + ss_w_pts, start_y + ss_h_pts)
+            text_rect = fitz.Rect(
+                start_x, start_y + ss_h_pts + gap,
+                start_x + text_box_w, start_y + ss_h_pts + gap + text_box_h
+            )
+
+        if screenshot_path and screenshot_path.exists() and ss_h_pts > 0:
+            page.insert_image(ss_rect, filename=str(screenshot_path))
+
+        current_lines = []
+        if prism_id:
+            current_lines.append(prism_id)
+        if node_name:
+            current_lines.append(node_name)
+        if print_name:
+            current_lines.append(print_name)
+        current_lines.append(f"PG {i + 1} OF {total_pages}")
+        if instance:
+            current_lines.append(instance)
+
+        text_content = "\n".join(current_lines)
+
+        page.draw_rect(text_rect, color=(1, 0, 0), fill=(1, 1, 0), width=1.5)
+        page.insert_textbox(
+            text_rect,
+            text_content,
+            fontsize=font_size,
+            fontname="helv",
+            color=(0, 0, 0),
+            align=0,
+        )
 
     doc.save(str(output_path), deflate=True, garbage=4, clean=True, linear=False)
     doc.close()

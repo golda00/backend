@@ -25,6 +25,7 @@ import logging
 import time
 
 import redis
+from contextlib import contextmanager
 
 from app.core.config import get_settings
 from app.models.schemas import JobStatus
@@ -36,13 +37,81 @@ from app.services.fiber_after import run_fiber_after_pipeline
 logger = logging.getLogger(__name__)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Shared helper: load job with Redis → jobs.json fallback
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_job_with_fallback(r: redis.Redis, job_id: str, settings) -> dict | None:
+    """
+    Try Redis first. If the job is not there (e.g. API used PersistentJobStore),
+    fall back to reading storage/outputs/jobs.json written by PersistentJobStore.
+    If found in the fallback, also write it into Redis so future lookups succeed.
+    """
+    raw = r.get(f"telecom_job:{job_id}")
+    if raw is not None:
+        return json.loads(raw)
+
+    # ── Fallback: read from PersistentJobStore flat file ─────────────────────
+    fallback_path = settings.OUTPUTS_DIR / "jobs.json"
+    if fallback_path.exists():
+        try:
+            with open(fallback_path, "r", encoding="utf-8") as f:
+                all_jobs = json.load(f)
+            if job_id in all_jobs:
+                job_data = all_jobs[job_id]
+                # Backfill Redis so subsequent lookups work
+                try:
+                    r.set(f"telecom_job:{job_id}", json.dumps(job_data), ex=86400)
+                    logger.info(f"[fallback] Backfilled job {job_id!r} from jobs.json into Redis.")
+                except Exception:
+                    pass
+                return job_data
+        except Exception as e:
+            logger.warning(f"[fallback] Could not read jobs.json: {e}")
+
+    return None
+
+# ── Global AI Engine Singletons ──────────────────────────────────
+_SHARED_DETECTOR = None
+_SHARED_OVERVIEW_PROCESSOR = None
+
+def _get_detector(settings):
+    """Worker-level singleton: Loads main models once per process."""
+    global _SHARED_DETECTOR
+    if _SHARED_DETECTOR is None:
+        from app.services.vision import TelecomDetector
+        logger.info("Initializing Shared AI Engine (this takes ~3 mins)...")
+        _SHARED_DETECTOR = TelecomDetector(
+            main_model_path=settings.MAIN_MODEL_PATH,
+            ps_model_path=settings.PS_MODEL_PATH,
+            node_model_path=settings.NODE_MODEL_PATH,
+            internal_model_path=settings.INTERNAL_MODEL_PATH,
+            use_gpu=settings.USE_GPU,
+            dpi=settings.PDF_DPI,
+        )
+        logger.info("✅ Shared AI Engine ready.")
+    return _SHARED_DETECTOR
+
+def _get_overview_processor(settings):
+    """Worker-level singleton: Loads Fiber Node model once."""
+    global _SHARED_OVERVIEW_PROCESSOR
+    if _SHARED_OVERVIEW_PROCESSOR is None:
+        from app.services.fiber_overview import FiberOverviewProcessor
+        logger.info("Initializing Fiber Overview Processor...")
+        _SHARED_OVERVIEW_PROCESSOR = FiberOverviewProcessor(
+            model_path=settings.FIBER_NODE_MODEL_PATH
+        )
+        logger.info("✅ Fiber Overview Processor ready.")
+    return _SHARED_OVERVIEW_PROCESSOR
+
+
 @celery_app.task(
     name="run_fiber_overview",
     bind=True,
     max_retries=1,
     default_retry_delay=10,
 )
-def run_fiber_overview_task(self, job_id: str) -> dict:
+def run_fiber_overview_task(self, job_id: str, job_data: dict | None = None) -> dict:
     """
     Celery task entry point for Fiber Overview pipeline.
     """
@@ -59,20 +128,29 @@ def run_fiber_overview_task(self, job_id: str) -> dict:
             else: super().update(**kwargs)
             _sync_update_job(r, job_id, dict(self))
 
-    raw = r.get(f"telecom_job:{job_id}")
-    if raw is None:
-        logger.error(f"[task] Job {job_id!r} not found in Redis")
+    # Try provided data first, then fallback
+    initial_data = job_data or _load_job_with_fallback(r, job_id, settings)
+    
+    if initial_data is None:
+        logger.error(f"[task] Job {job_id!r} not found (no job_data, Redis, or jobs.json)")
         return {"error": "Job not found"}
 
-    initial_data = json.loads(raw)
+    # If we got data from the message but it's missing from Redis, backfill now
+    if job_data and not r.exists(f"telecom_job:{job_id}"):
+        try:
+            r.set(f"telecom_job:{job_id}", json.dumps(job_data), ex=86400)
+            logger.info(f"[task] Backfilled Redis for {job_id!r} using job_data from message.")
+        except Exception: pass
+
     proxy_store = {job_id: _RedisSyncProxy(initial_data)}
 
+    logger.info(f"[{job_id}] 🚀 Fiber Overview task started.")
     try:
         run_fiber_overview_pipeline(
             job_id=job_id,
             job_store=proxy_store,
             settings=settings,
-            processor=None,
+            processor=_get_overview_processor(settings),
         )
     except Exception as exc:
         logger.exception(f"[task] Fiber pipeline failed: {exc}")
@@ -93,7 +171,7 @@ def run_fiber_overview_task(self, job_id: str) -> dict:
     max_retries=1,
     default_retry_delay=10,
 )
-def run_fiber_before_task(self, job_id: str) -> dict:
+def run_fiber_before_task(self, job_id: str, job_data: dict | None = None) -> dict:
     """
     Celery task entry point for Fiber Before map workflow.
     """
@@ -110,12 +188,16 @@ def run_fiber_before_task(self, job_id: str) -> dict:
             else: super().update(**kwargs)
             _sync_update_job(r, job_id, dict(self))
 
-    raw = r.get(f"telecom_job:{job_id}")
-    if raw is None:
-        logger.error(f"[task] Job {job_id!r} not found in Redis")
+    initial_data = job_data or _load_job_with_fallback(r, job_id, settings)
+    if initial_data is None:
+        logger.error(f"[task] Job {job_id!r} not found")
         return {"error": "Job not found"}
 
-    initial_data = json.loads(raw)
+    if job_data and not r.exists(f"telecom_job:{job_id}"):
+        try:
+            r.set(f"telecom_job:{job_id}", json.dumps(job_data), ex=86400)
+        except Exception: pass
+
     proxy_store = {job_id: _RedisSyncProxy(initial_data)}
 
     from app.services.fiber_before import run_fiber_before_pipeline
@@ -145,7 +227,7 @@ def run_fiber_before_task(self, job_id: str) -> dict:
     max_retries=1,
     default_retry_delay=10,
 )
-def run_coax_before_task(self, job_id: str) -> dict:
+def run_coax_before_task(self, job_id: str, job_data: dict | None = None) -> dict:
     """
     Celery task entry point for Coax Before map workflow.
     """
@@ -162,12 +244,16 @@ def run_coax_before_task(self, job_id: str) -> dict:
             else: super().update(**kwargs)
             _sync_update_job(r, job_id, dict(self))
 
-    raw = r.get(f"telecom_job:{job_id}")
-    if raw is None:
-        logger.error(f"[task] Job {job_id!r} not found in Redis")
+    initial_data = job_data or _load_job_with_fallback(r, job_id, settings)
+    if initial_data is None:
+        logger.error(f"[task] Job {job_id!r} not found")
         return {"error": "Job not found"}
 
-    initial_data = json.loads(raw)
+    if job_data and not r.exists(f"telecom_job:{job_id}"):
+        try:
+            r.set(f"telecom_job:{job_id}", json.dumps(job_data), ex=86400)
+        except Exception: pass
+
     proxy_store = {job_id: _RedisSyncProxy(initial_data)}
 
     from app.services.coax_before import run_coax_before_pipeline
@@ -195,7 +281,7 @@ def run_coax_before_task(self, job_id: str) -> dict:
     max_retries=1,
     default_retry_delay=10,
 )
-def run_fiber_after_task(self, job_id: str) -> dict:
+def run_fiber_after_task(self, job_id: str, job_data: dict | None = None) -> dict:
     """
     Celery task entry point for the Fiber After ML pipeline.
     """
@@ -212,12 +298,16 @@ def run_fiber_after_task(self, job_id: str) -> dict:
             else: super().update(**kwargs)
             _sync_update_job(r, job_id, dict(self))
 
-    raw = r.get(f"telecom_job:{job_id}")
-    if raw is None:
-        logger.error(f"[task] Job {job_id!r} not found in Redis")
+    initial_data = job_data or _load_job_with_fallback(r, job_id, settings)
+    if initial_data is None:
+        logger.error(f"[task] Job {job_id!r} not found")
         return {"error": "Job not found"}
 
-    initial_data = json.loads(raw)
+    if job_data and not r.exists(f"telecom_job:{job_id}"):
+        try:
+            r.set(f"telecom_job:{job_id}", json.dumps(job_data), ex=86400)
+        except Exception: pass
+
     proxy_store = {job_id: _RedisSyncProxy(initial_data)}
 
     try:
@@ -242,12 +332,25 @@ def run_fiber_after_task(self, job_id: str) -> dict:
 def _sync_update_job(r: redis.Redis, job_id: str, updates: dict, ttl: int = 86400) -> None:
     """
     Synchronously merge updates into a Redis job record.
-    Used by the Celery task (no asyncio event loop in worker processes).
+    Falls back to reading from jobs.json if the key isn't in Redis yet.
     """
     raw = r.get(f"telecom_job:{job_id}")
     if raw is None:
-        logger.warning(f"[task] Job {job_id!r} not found in Redis for update.")
-        return
+        # Try to backfill from jobs.json fallback
+        settings = get_settings()
+        fallback_path = settings.OUTPUTS_DIR / "jobs.json"
+        if fallback_path.exists():
+            try:
+                with open(fallback_path, "r", encoding="utf-8") as f:
+                    all_jobs = json.load(f)
+                if job_id in all_jobs:
+                    raw = json.dumps(all_jobs[job_id])
+                    logger.info(f"[_sync_update_job] Loaded {job_id!r} from jobs.json fallback.")
+            except Exception as e:
+                logger.warning(f"[_sync_update_job] Could not read jobs.json: {e}")
+        if raw is None:
+            logger.warning(f"[task] Job {job_id!r} not found in Redis or jobs.json for update.")
+            return
 
     def _parse_status(val):
         if isinstance(val, str):
@@ -278,29 +381,16 @@ def _sync_update_job(r: redis.Redis, job_id: str, updates: dict, ttl: int = 8640
     max_retries=1,          # retry once on unexpected failure
     default_retry_delay=10,
 )
-def run_pipeline_task(self, job_id: str) -> dict:
+def run_pipeline_task(self, job_id: str, job_data: dict | None = None) -> dict:
     """
     Celery task entry point for the full pipeline.
-
-    Uses a synchronous Redis client (redis-py) to write job state because
-    Celery worker processes don't have an asyncio event loop.
-
-    The pipeline's run_pipeline_sync() is called with a simple dict-like
-    proxy that writes updates straight to Redis.
     """
     settings = get_settings()
 
     # ── Connect to Redis (sync client inside Celery worker) ──────────
     r = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
-    # ── Build a sync dict-proxy so run_pipeline_sync can "update" it ─
-    # run_pipeline_sync was designed to update a dict in-place; we wrap
-    # a Redis write behind the same interface.
     class _RedisSyncProxy(dict):
-        """
-        Looks like a dict to run_pipeline_sync but persists every write
-        to Redis. Reads are served from the local cache (for speed).
-        """
         def __init__(self, initial: dict):
             super().__init__(initial)
 
@@ -312,23 +402,27 @@ def run_pipeline_task(self, job_id: str) -> dict:
                 super().update(other, **kwargs)
             else:
                 super().update(**kwargs)
-            # Flush full record to Redis after every update
             _sync_update_job(r, job_id, dict(self))
 
-    raw = r.get(f"telecom_job:{job_id}")
-    if raw is None:
-        logger.error(f"[task] Job {job_id!r} not found in Redis — aborting.")
+    initial_data = job_data or _load_job_with_fallback(r, job_id, settings)
+    if initial_data is None:
+        logger.error(f"[task] Job {job_id!r} not found — aborting.")
         return {"error": "Job not found"}
 
-    initial_data = json.loads(raw)
+    if job_data and not r.exists(f"telecom_job:{job_id}"):
+        try:
+            r.set(f"telecom_job:{job_id}", json.dumps(job_data), ex=86400)
+        except Exception: pass
+
     proxy_store = {job_id: _RedisSyncProxy(initial_data)}
 
+    logger.info(f"[{job_id}] 🚀 Main Coax/Fiber task started.")
     try:
         run_pipeline_sync(
             job_id=job_id,
             job_store=proxy_store,
             settings=settings,
-            detector=None,      # Celery workers load models once at process init (see below)
+            detector=_get_detector(settings), # Use the Warm Engine
         )
     except Exception as exc:
         logger.exception(f"[task] Pipeline failed for job {job_id}: {exc}")

@@ -65,8 +65,8 @@ class Settings(BaseSettings):
     # --- Safety & Performance ---
     # Max upload size per file (default 200 MB)
     MAX_UPLOAD_BYTES: int = 200 * 1024 * 1024
-    # Max seconds a pipeline job may run before being killed (default 30 min)
-    JOB_TIMEOUT_SECONDS: float = 1800.0
+    # Max seconds a pipeline job may run before being killed (default 1 hour)
+    JOB_TIMEOUT_SECONDS: float = 3600.0
     # Number of dedicated pipeline worker threads (separate from FastAPI's I/O pool)
     PIPELINE_WORKERS: int = 4
     # Hours after which completed/failed jobs and their files are auto-deleted

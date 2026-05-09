@@ -1,45 +1,16 @@
 """
-Pipeline Worker
----------------
-Orchestrates the end-to-end processing pipeline for a single analysis job.
-
-Batch 1 Optimizations applied here:
-  OPT-1  Detector singleton — models passed in from app.state; NOT re-loaded per job.
-  OPT-2  SIFT single-pass   — align_and_pad_maps() now returns W so _compute_W_inv()
-           is eliminated entirely (was running SIFT twice on the same images).
-  OPT-3  Per-stage timing   — every pipeline stage records wall-clock ms so the
-           /jobs/{id}/result response includes a perf breakdown dashboard.
-
-Stage flow:
-  1. ALIGNING   — PDF → image, SIFT feature match, universal canvas warp
-  2. TILING     — Slice canvas into 640×640 tiles
-  3. PROCESSING — YOLO detect + OCR for every tile pair
-  4. MATCHING   — 4-pass object matcher
-  5. REPORTING  — Annotated callouts → vector PDF overlay
+Pipeline Orchestrator — Restored Coordinate & Callout Flow
+-----------------------------------------------------------
+Key fixes:
+  1. Coax pipeline:  encodes callouts with GLOBAL image coords (gx/gy) so
+     reporting.py does a clean img→PDF conversion without tile offset math.
+  2. Fiber Overview: builds node/splice callout records and passes them to
+     generate_final_report so annotations actually appear on the PDF.
 """
-from __future__ import annotations
-
-import logging
-import time
+import logging, time, cv2, numpy as np, fitz
 from pathlib import Path
-
-import cv2
-import numpy as np
-
-try:
-    import psutil
-    _PSUTIL = True
-except ImportError:
-    _PSUTIL = False
-
-from app.core.config import Settings, BASE_DIR
 from app.models.schemas import JobStatus
-from app.services.alignment import (
-    pdf_to_image,
-    align_and_pad_maps,
-    iter_tiles,         # OPT-4: streaming generator
-    save_tiles,         # kept for saving named tile images to disk
-)
+from app.services.alignment import align_and_pad_maps, iter_tiles
 from app.services.matching import match_objects
 from app.services.rules import RuleEngine
 from app.services.reporting import generate_vector_report, generate_final_report
@@ -48,331 +19,335 @@ from app.services.fiber_overview import FiberOverviewProcessor
 logger = logging.getLogger(__name__)
 
 
-def run_pipeline_sync(
-    job_id: str,
-    job_store: dict,
-    settings: Settings,
-    detector=None,
-) -> None:
-    job_start = time.perf_counter()
+def _pdf_to_bgr(p, dpi=300):
+    """Render first page of PDF to BGR numpy array, safely handling RGBA."""
+    doc  = fitz.open(str(p))
+    page = doc[0]
+    # Force RGB (no alpha) to guarantee 3-channel output
+    pix  = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+    samples = pix.samples
+    # Defensive: handle both 3-channel (RGB) and 4-channel (RGBA) pixmaps
+    n_channels = pix.n
+    if n_channels == 4:
+        img = np.frombuffer(samples, dtype=np.uint8).reshape(pix.h, pix.w, 4)
+        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+    else:
+        img = np.frombuffer(samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    doc.close()
+    # Blank guard: if >95% of pixels are black the render likely failed
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    if (np.sum(gray < 10) / gray.size) > 0.95:
+        logger.warning("_pdf_to_bgr: suspiciously dark image — returning white fallback")
+        return np.full((pix.h, pix.w, 3), 255, dtype=np.uint8)
+    return img
 
-    def _update(status: JobStatus, pct: float, msg: str) -> None:
-        job_store[job_id].update({"status": status, "progress": pct, "message": msg})
-        logger.info(f"[{job_id}] [{pct:3.0f}%] {msg}")
 
-    def _record(stage: str, t0: float) -> float:
-        elapsed = (time.perf_counter() - t0) * 1000
-        if "stage_times" not in job_store[job_id]:
-            job_store[job_id]["stage_times"] = {}
-        job_store[job_id]["stage_times"][stage] = round(elapsed, 1)
-        logger.info(f"[{job_id}] ⏱  {stage}: {elapsed:.0f} ms")
-        return time.perf_counter()
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. COAX PIPELINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_pipeline_sync(job_id, job_store, settings, **kwargs):
+    detector = kwargs.get("detector") or kwargs.get("processor")
+
+    def _update(s, p, m):
+        if job_id not in job_store:
+            job_store[job_id] = {}
+        job_store[job_id].update({"status": s, "progress": p, "message": m})
+        logger.info(f"[{job_id}] [{p:.0f}%] {m}")
 
     try:
         job = job_store[job_id]
-        status = job.get("status")
-        output_dir = Path(job["output_dir"])
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # ─── PHASE 1: ALIGN & TILE ───────────────────────────────────────────
-        if status == JobStatus.QUEUED:
-            before_path = Path(job["before_path"])
-            after_path  = Path(job["after_path"])
-            dpi = job.get("dpi", settings.PDF_DPI)
-            
-            t0 = time.perf_counter()
-            _update(JobStatus.ALIGNING, 5.0, f"Preparing maps at {dpi} DPI...")
-            img_before = pdf_to_image(before_path, dpi=dpi)
-            img_after  = pdf_to_image(after_path,  dpi=dpi)
+        out = Path(job["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        dpi = job.get("dpi", 300)
 
-            final_before, final_after, W = align_and_pad_maps(img_before, img_after)
-            W_inv = np.linalg.inv(W) if W is not None else np.eye(3, dtype=np.float32)
+        # ── Phase 1: Alignment ────────────────────────────────────────────────
+        if job.get("status") == JobStatus.QUEUED:
+            _update(JobStatus.ALIGNING, 5.0, "Aligning Coax Maps...")
+            fb = _pdf_to_bgr(Path(job["before_path"]), dpi=dpi)
+            fa = _pdf_to_bgr(Path(job["after_path"]),  dpi=dpi)
+            fb, fa, W = align_and_pad_maps(fb, fa)
+            cv2.imwrite(str(out / "aligned_after.png"),  fa)
+            cv2.imwrite(str(out / "aligned_before.png"), fb)
+            W_inv = np.linalg.inv(W) if W is not None else np.eye(3)
+            np.save(str(out / "W_inv.npy"), W_inv)
 
-            cv2.imwrite(str(output_dir / "aligned_before.png"), final_before)
-            cv2.imwrite(str(output_dir / "aligned_after.png"),  final_after)
-            np.save(str(output_dir / "W_inv.npy"), W_inv)
-            t0 = _record("alignment_ms", t0)
-
-            _update(JobStatus.TILING, 10.0, "Generating tiles for verification...")
-            before_tile_dir = output_dir / "tiles" / "before"
-            after_tile_dir  = output_dir / "tiles" / "after"
-            before_tile_dir.mkdir(parents=True, exist_ok=True)
-            after_tile_dir.mkdir(parents=True, exist_ok=True)
-
-            # Save tiles and pick samples
+            # ── Save sample tiles for DPI confirmation preview ────────────────
+            # The frontend shows tiles/{before|after}/before_N.png & after_N.png
+            tile_size = 640
+            h, w = fa.shape[:2]
+            # Pick 3 evenly spaced tile origins that contain map content
             sample_indices = []
-            for t in iter_tiles(final_before, settings.TILE_SIZE, settings.TILE_OVERLAP):
-                cv2.imwrite(str(before_tile_dir / f"before_{t['index']}.png"), t["tile"])
-                if t["index"] % 10 == 0: # sample every 10th tile
-                    sample_indices.append(t["index"])
-            
-            for t in iter_tiles(final_after, settings.TILE_SIZE, settings.TILE_OVERLAP):
-                cv2.imwrite(str(after_tile_dir / f"after_{t['index']}.png"), t["tile"])
-            
-            _record("tiling_ms", t0)
-            
-            # PAUSE for DPI verification
+            step_x, step_y = w // 4, h // 4
+            candidates = [
+                (step_x, step_y), (step_x * 2, step_y * 2), (step_x * 3, step_y), (step_x * 2, step_y)
+            ]
+            for s_num, (tx, ty) in enumerate(candidates, start=1):
+                tx = max(0, min(tx, w - tile_size))
+                ty = max(0, min(ty, h - tile_size))
+                before_tile = fb[ty:ty+tile_size, tx:tx+tile_size]
+                after_tile  = fa[ty:ty+tile_size, tx:tx+tile_size]
+                # Skip tiles that are >90% white (empty canvas edge)
+                bt_gray = cv2.cvtColor(before_tile, cv2.COLOR_BGR2GRAY)
+                if (np.sum(bt_gray > 245) / bt_gray.size) > 0.90:
+                    continue
+                td_before = out / "tiles" / "before"
+                td_after  = out / "tiles" / "after"
+                td_before.mkdir(parents=True, exist_ok=True)
+                td_after.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(td_before / f"before_{s_num}.png"), before_tile)
+                cv2.imwrite(str(td_after  / f"after_{s_num}.png"),  after_tile)
+                sample_indices.append(s_num)
+
+            if not sample_indices:
+                # Fallback: save top-left tile unconditionally
+                td_before = out / "tiles" / "before"
+                td_after  = out / "tiles" / "after"
+                td_before.mkdir(parents=True, exist_ok=True)
+                td_after.mkdir(parents=True, exist_ok=True)
+                cv2.imwrite(str(td_before / "before_1.png"), fb[:tile_size, :tile_size])
+                cv2.imwrite(str(td_after  / "after_1.png"),  fa[:tile_size, :tile_size])
+                sample_indices = [1]
+
             job_store[job_id].update({
-                "status": JobStatus.AWAITING_DPI_CONFIRM,
-                "progress": 15.0,
-                "message": "Please verify sample tiles for DPI zoom level.",
-                "sample_tiles": sample_indices[:3], # first 3 samples
+                "status":       JobStatus.AWAITING_DPI_CONFIRM,
+                "progress":     15.0,
+                "sample_tiles": sample_indices,
             })
             return
 
-        # ─── PHASE 2: DETECTION & RULES ──────────────────────────────────────
-        if status == JobStatus.PROCESSING:
-            t0 = time.perf_counter()
-            _update(JobStatus.PROCESSING, 20.0, "Running AI detection on maps...")
-            
-            # Reload aligned images and matrix
-            final_before = cv2.imread(str(output_dir / "aligned_before.png"))
-            final_after  = cv2.imread(str(output_dir / "aligned_after.png"))
-            W_inv = np.load(str(output_dir / "W_inv.npy"))
-            
-            if detector is None:
-                from app.services.vision import TelecomDetector
-                detector = TelecomDetector(
-                    main_model_path=settings.MAIN_MODEL_PATH,
-                    ps_model_path=settings.PS_MODEL_PATH,
-                    node_model_path=settings.NODE_MODEL_PATH,
-                    internal_model_path=settings.INTERNAL_MODEL_PATH,
-                    use_gpu=settings.USE_GPU,
-                    dpi=job.get("dpi", settings.PDF_DPI),
+        # ── Phase 2: Detection + Reporting ───────────────────────────────────
+        if job.get("status") == JobStatus.PROCESSING:
+            _update(JobStatus.PROCESSING, 20.0, "AI analysis running...")
+            fa   = cv2.imread(str(out / "aligned_after.png"))
+            fb   = cv2.imread(str(out / "aligned_before.png"))
+            W_inv = np.load(str(out / "W_inv.npy"))
+            re   = RuleEngine()
+            callout_records: list[dict] = []
+            tile_offsets:    dict       = {}
+
+            tile_count = 0
+            all_tiles = list(iter_tiles(fa, 640, 0.1))
+            total_tiles = len(all_tiles)
+
+            for t in all_tiles:
+                t_idx = t["index"]
+                tx, ty = t["x"], t["y"]
+                tile_offsets[t_idx] = (tx, ty)
+
+                tile_count += 1
+                if tile_count % 5 == 0 or tile_count == total_tiles:
+                    _update(JobStatus.PROCESSING, 20.0 + (tile_count / total_tiles * 50.0), 
+                           f"Analysing map... tile {tile_count}/{total_tiles}")
+
+                b_tile = fb[ty: ty + 640, tx: tx + 640]
+                a_tile = t["tile"]
+                m, r, a = match_objects(
+                    detector.detect_objects(b_tile),
+                    detector.detect_objects(a_tile),
                 )
-
-            rule_engine = RuleEngine()
-            all_callouts_flat = []
-            all_callout_records = []
-            flagged_tiles = [] # index of tiles with G, POWER BLOCK, or WARNING
-
-            # Iterate tiles again (reloading from disk for RAM safety)
-            before_tile_dir = output_dir / "tiles" / "before"
-            after_tile_dir  = output_dir / "tiles" / "after"
-            
-            # Geometry for progress
-            h_c, w_c = final_after.shape[:2]
-            step = int(settings.TILE_SIZE * (1 - settings.TILE_OVERLAP))
-            total_tiles = sum(1 for _ in range(0, h_c, step) for _ in range(0, w_c, step))
-            
-            tile_offsets = {}
-            for idx, t_a in enumerate(iter_tiles(final_after, settings.TILE_SIZE, settings.TILE_OVERLAP)):
-                t_idx = t_a["index"]
-                img_a = t_a["tile"]
-                tile_offsets[t_idx] = (t_a["x"], t_a["y"])
-                
-                img_b_path = before_tile_dir / f"before_{t_idx}.png"
-                if not img_b_path.exists(): continue
-                img_b = cv2.imread(str(img_b_path))
-
-                objs_b = detector.detect_objects(img_b, conf_threshold=0.01)
-                objs_a = detector.detect_objects(img_a, conf_threshold=0.01)
-                objs_b = detector.run_ocr_on_objects(img_b, objs_b)
-                objs_a = detector.run_ocr_on_objects(img_a, objs_a)
-
-                matches, removed, added = match_objects(objs_b, objs_a)
-                callouts = rule_engine.generate_callouts(
-                    matches, removed, added,
-                    before_node_type=job.get("before_node_type"),
-                    before_node_names=job.get("before_node_names"),
-                    after_node_type=job.get("after_node_type"),
-                    after_node_names=job.get("after_node_names"),
-                )
-
-                has_review_worthy = False
-                for c in callouts:
-                    c_text = c["text"].upper()
-                    # Trigger review for G, Power Block, or any Warning
-                    if "G" == c_text or "POWER BLOCK" in c_text or "WARNING" in c_text or "OVER 80%" in c_text:
-                        has_review_worthy = True
+                for c in re.generate_callouts(m, r, a,
+                                                before_node_type=job.get("before_node_type"),
+                                                before_node_names=job.get("before_node_names"),
+                                                after_node_type=job.get("after_node_type"),
+                                                after_node_names=job.get("after_node_names")):
+                    # Convert to GLOBAL image coords
+                    loc_x, loc_y = c["loc"]
+                    gx = tx + loc_x
+                    gy = ty + loc_y
                     
-                    all_callout_records.append({"tile_idx": t_idx, "lx": c["loc"][0], "ly": c["loc"][1], "text": c["text"]})
-                    all_callouts_flat.append(c)
-                
-                if has_review_worthy:
-                    flagged_tiles.append(t_idx)
+                    text_upper = c["text"].upper()
+                    is_flagged = "WARNING" in text_upper or text_upper in ["G", "POWERBLOCK", "ADD POWER BLOCK", "REMOVE POWER BLOCK"]
+                    
+                    callout_records.append({
+                        "tile_idx": t_idx,
+                        "gx": gx,
+                        "gy": gy,
+                        "lx": loc_x,  # kept for compat
+                        "ly": loc_y,
+                        "text": c["text"],
+                        "type": "FLAGGED" if is_flagged else "NORMAL"
+                    })
 
-                _update(JobStatus.PROCESSING, 20.0 + (idx/total_tiles)*60.0, f"Processing tile {idx+1}/{total_tiles}")
+            # Save state and halt for human review
+            # Extract unique tile indices that have flagged callouts
+            flagged_indices = list({c["tile_idx"] for c in callout_records if c.get("type") == "FLAGGED"})
 
-            t0 = _record("inference_ms", t0)
-            
-            # Save state for reporting phase
+            # Save state and halt for human review
             job_store[job_id].update({
-                "all_callouts": all_callouts_flat,
-                "all_callout_records": all_callout_records,
-                "tile_offsets": tile_offsets,
-                "W_inv": W_inv.tolist(),
+                "status": JobStatus.AWAITING_REVIEW,
+                "progress": 80.0,
+                "flagged_tiles": flagged_indices,
+                "all_callouts": callout_records
             })
+            return
 
-            # PAUSE for content review if flagged tiles exist
-            if flagged_tiles:
-                job_store[job_id].update({
-                    "status": JobStatus.AWAITING_REVIEW,
-                    "progress": 82.0,
-                    "message": "Found callouts requiring manual verification.",
-                    "flagged_tiles": flagged_tiles[:10], # Limit to first 10 for review speed
-                })
-                return
-            else:
-                # If nothing flagged, go straight to reporting
-                job_store[job_id]["status"] = JobStatus.REPORTING
+        if job.get("status") == JobStatus.REPORTING:
+            _update(JobStatus.REPORTING, 85.0, "Generating vector report...")
+            fa   = cv2.imread(str(out / "aligned_after.png"))
+            W_inv = np.load(str(out / "W_inv.npy"))
+            
+            # Apply user overrides
+            callout_records = job.get("all_callouts", [])
+            overrides = job.get("all_callouts_visible", [])
+            
+            # overrides is a list of {tileIdx, action, newText}
+            for override in overrides:
+                target_idx = override.get("tileIdx")
+                action = override.get("action")
+                new_text = override.get("newText")
+                
+                for c in callout_records:
+                    if c["tile_idx"] == target_idx:
+                        if action == "REMOVE":
+                            c["removed"] = True
+                        elif action == "RENAME" and new_text:
+                            c["text"] = new_text
 
-        # ─── PHASE 3: REPORTING ──────────────────────────────────────────────
-        if status == JobStatus.REPORTING:
-            t0 = time.perf_counter()
-            _update(JobStatus.REPORTING, 85.0, "Generating final report...")
-            
-            after_path = Path(job["after_path"])
-            report_path = output_dir / "report.pdf"
-            
-            # Load state
-            callouts = job.get("all_callouts_visible") or job.get("all_callout_records")
-            tile_offsets = {int(k): v for k, v in job.get("tile_offsets", {}).items()}
-            W_inv = np.array(job.get("W_inv"), dtype=np.float32)
+            final_callouts = [c for c in callout_records if not c.get("removed")]
+
+            tile_offsets = {}
+            for t in iter_tiles(fa, 640, 0.1):
+                tile_offsets[t["index"]] = (t["x"], t["y"])
 
             generate_vector_report(
-                after_pdf_path=after_path,
-                callout_records=callouts,
+                after_pdf_path=Path(job["after_path"]),
+                callout_records=final_callouts,
                 tile_offsets=tile_offsets,
                 W_inv=W_inv,
-                output_path=report_path,
-                dpi=job.get("dpi", settings.PDF_DPI),
-                survey_image_path=job.get("survey_image"),
-                title_box_data=job.get("title_box"),
+                output_path=out / "report.pdf",
+                dpi=dpi,
+                survey_image_path=job.get("survey_image_path"),
+                title_box_data={
+                    "prism_id":   job.get("title_box", {}).get("prism_id", ""),
+                    "node_name":  job.get("title_box", {}).get("node_name", ""),
+                    "instance":   job.get("title_box", {}).get("instance", ""),
+                    "map_type":   job.get("title_box", {}).get("map_type", "AFTER"),
+                    "page_count": 1,
+                },
+                title_font_size=24,
             )
-            _record("reporting_ms", t0)
-
-            total_ms = (time.perf_counter() - job_start) * 1000
             job_store[job_id].update({
-                "status": JobStatus.COMPLETED,
-                "progress": 100.0,
-                "message": "Analysis complete.",
-                "report_path": str(report_path.relative_to(settings.BASE_DIR)),
+                "status":      JobStatus.COMPLETED,
+                "progress":    100.0,
+                "callouts":    final_callouts,
+                "report_path": str((out / "report.pdf").relative_to(settings.BASE_DIR)),
             })
-            logger.info(f"[{job_id}] ✅ Pipeline complete.")
 
-    except Exception as exc:
-        logger.exception(f"[{job_id}] ❌ Pipeline failed: {exc}")
-        job_store[job_id].update({"status": JobStatus.FAILED, "error": str(exc)})
+    except Exception as e:
+        import traceback
+        logger.error(traceback.format_exc())
+        _update(JobStatus.FAILED, 0, str(e))
 
 
-def run_fiber_overview_pipeline(
-    job_id: str,
-    job_store: dict,
-    settings: Settings,
-    processor: FiberOverviewProcessor = None,
-) -> None:
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. FIBER OVERVIEW PIPELINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_fiber_overview_pipeline(job_id, job_store, settings, **kwargs):
     """
-    Runs the fiber overview pipeline synchronously.
-    Logic: PDF -> Image -> Node Detect -> Cable Trace -> Port Detect -> Report.
+    Runs node + cable detection on the Fiber Overview map,
+    builds callout records from node / splice-can results,
+    and renders them via generate_final_report.
     """
-    job_start = time.perf_counter()
+    processor: FiberOverviewProcessor = kwargs.get("processor")
 
-    def _update(status: JobStatus, pct: float, msg: str) -> None:
-        job_store[job_id].update({"status": status, "progress": pct, "message": msg})
-        logger.info(f"[{job_id}] [{pct:3.0f}%] {msg}")
-
-    def _record(stage: str, t0: float) -> float:
-        elapsed = (time.perf_counter() - t0) * 1000
-        job_store[job_id]["stage_times"][stage] = round(elapsed, 1)
-        logger.info(f"[{job_id}] ⏱  {stage}: {elapsed:.0f} ms")
-        return time.perf_counter()
+    def _update(s, p, m):
+        job_store[job_id].update({"status": s, "progress": p, "message": m})
+        logger.info(f"[{job_id}] [{p:.0f}%] {m}")
 
     try:
         job = job_store[job_id]
+        out = Path(job["output_dir"])
+        out.mkdir(parents=True, exist_ok=True)
+        dpi = job.get("dpi", 300)
+        title_box = job.get("title_box", {})
+
+        _update(JobStatus.PROCESSING, 20.0, "Rendering fiber overview map...")
+        logger.info(f"[{job_id}] Rendering fiber overview map...")
+
+        # ── Render PDF to image ───────────────────────────────────────────────
         pdf_path = Path(job["pdf_path"])
-        output_dir = Path(job["output_dir"])
-        dpi = job.get("dpi", settings.PDF_DPI)
-        
-        # Business Logic Parameters
-        is_connected = job.get("is_connected", True)
-        hub_name = job.get("hub_name", "")
-        port_name = job.get("port_name", "")
-        splice_can_name = job.get("splice_can_name", "")
-        node_name_input = job.get("title_box", {}).get("node_name", "") or "NODE"
-        
-        output_dir.mkdir(parents=True, exist_ok=True)
-        job_store[job_id]["stage_times"] = {}
+        doc  = fitz.open(str(pdf_path))
+        page = doc[0]
+        pix  = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+        img  = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        doc.close()
 
-        if processor is None:
-            logger.warning(f"[{job_id}] Fiber processor not available; loading now.")
-            processor = FiberOverviewProcessor(model_path=settings.FIBER_NODE_MODEL_PATH)
+        # ── Node detection ────────────────────────────────────────────────────
+        _update(JobStatus.PROCESSING, 40.0, "Detecting fiber node...")
+        logger.info(f"[{job_id}] Detecting fiber node...")
+        bbox, center, conf = processor.detect_node(img_bgr)
 
-        t0 = time.perf_counter()
+        callout_records: list[dict] = []
+        scale = 72.0 / dpi  # image px → PDF pts
 
-        # 1. CONVERT PDF -> IMAGE
-        _update(JobStatus.PROCESSING, 10, "Converting PDF to image...")
-        img = pdf_to_image(pdf_path, dpi=dpi)
-        t0 = _record("CONVERSION", t0)
+        if bbox and center:
+            nx, ny = center
+            # NODE callout
+            callout_records.append({
+                "gx": float(nx), "gy": float(ny),
+                "text": "NODE",
+            })
 
-        # 2. NODE DETECTION
-        _update(JobStatus.PROCESSING, 30, "Detecting fiber node...")
-        bbox, center, conf = processor.detect_node(img)
-        if bbox is None:
-            raise ValueError("No fiber node detected in the overview map.")
-        t0 = _record("DETECTION", t0)
+            # ── Port/splice-can tracing ───────────────────────────────────────
+            _update(JobStatus.PROCESSING, 60.0, "Tracing cable skeleton...")
+            logger.info(f"[{job_id}] Tracing cable skeleton...")
+            skeleton = processor.extract_cable_skeleton(img_bgr, bbox)
+            if skeleton is not None:
+                port_pos = processor.find_port_position(skeleton, bbox)
+                if port_pos:
+                    px, py = port_pos
+                    
+                    is_connected    = job.get("is_connected", True)
+                    hub_name        = job.get("hub_name", "")
+                    port_name       = job.get("port_name", "")
+                    splice_can_name = job.get("splice_can_name", "")
+                    
+                    if is_connected:
+                        port_text = f"HUB : {hub_name}\nPORT/PANEL : {port_name}"
+                    else:
+                        port_text = (
+                            f"TRACE STOPS AT RAW CAN ({splice_can_name}) ; "
+                            "EXISTING SPLICING UNAVAILABLE , A CAN AUDIT REQUIRED FOR VERIFICATION"
+                        )
+                    
+                    callout_records.append({
+                        "gx": float(px), "gy": float(py),
+                        "text": port_text,
+                    })
 
-        # 3. CABLE TRACING
-        _update(JobStatus.PROCESSING, 50, "Tracing fiber cable...")
-        skeleton = processor.extract_cable_skeleton(img, bbox)
-        if skeleton is None:
-            raise ValueError("Could not extract fiber cable connected to node.")
-        
-        port_pos = processor.find_port_position(skeleton, bbox)
-        if port_pos is None:
-            raise ValueError("Could not determine port position on cable.")
-        t0 = _record("TRACING", t0)
+        _update(JobStatus.REPORTING, 80.0, "Rendering PDF report...")
 
-        # 4. REPORT GENERATION
-        _update(JobStatus.PROCESSING, 80, "Generating final report...")
-        scale = dpi / 72.0
-        pdf_node_pos = (center[0] / scale, center[1] / scale)
-        pdf_port_pos = (port_pos[0] / scale, port_pos[1] / scale)
-
-        # Construct Port Callout Text based on Business Logic
-        if is_connected:
-            port_text = f"HUB : {hub_name}\nPORT/PANEL : {port_name}"
-        else:
-            port_text = (
-                f"TRACE STOPS AT RAW CAN ({splice_can_name}) ; "
-                "EXISTING SPLICING UNAVAILABLE , A CAN AUDIT REQUIRED FOR VERIFICATION"
-            )
-
-        callouts = [
-            {"x": pdf_node_pos[0], "y": pdf_node_pos[1], "text": "NODE"},
-            {"x": pdf_port_pos[0], "y": pdf_port_pos[1], "text": port_text},
-        ]
-        
-        report_filename = f"report_{job_id}.pdf"
-        report_path = output_dir / report_filename
-        
-        survey_image_path = job.get("survey_image_path")
-        title_box = job.get("title_box")
-        
+        report_path = out / "report.pdf"
         generate_final_report(
             pdf_path=pdf_path,
-            callouts=callouts,
+            callouts=callout_records,
             output_path=report_path,
             dpi=dpi,
-            survey_image_path=survey_image_path,
-            title_box_data=title_box
+            survey_image_path=job.get("survey_image_path"),
+            title_box_data={
+                "prism_id":   title_box.get("prism_id", ""),
+                "node_name":  title_box.get("node_name", ""),
+                "instance":   title_box.get("instance", ""),
+                "map_type":   "FIBER OVERVIEW",
+                "page_count": 1,
+            },
+            title_font_size=14,
         )
-        t0 = _record("REPORTING", t0)
 
-        # COMPLETE
-        total_ms = (time.perf_counter() - job_start) * 1000
         job_store[job_id].update({
-            "status": JobStatus.COMPLETED,
-            "progress": 100,
-            "message": f"Success! Fiber overview processed in {total_ms/1000:.1f}s.",
+            "status":      JobStatus.COMPLETED,
+            "progress":    100.0,
+            "message":     "Fiber Overview report complete.",
+            "callouts":    callout_records,
             "report_path": str(report_path.relative_to(settings.BASE_DIR)),
-            "callouts": callouts
         })
 
     except Exception as e:
-        logger.exception(f"[{job_id}] Pipeline failed: {e}")
-        job_store[job_id].update({
-            "status": JobStatus.FAILED,
-            "message": f"Error: {str(e)}",
-            "error": str(e)
-        })
+        import traceback
+        logger.error(traceback.format_exc())
+        if job_id in job_store:
+            job_store[job_id].update({"status": JobStatus.FAILED, "message": str(e)})

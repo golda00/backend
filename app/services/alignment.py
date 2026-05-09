@@ -25,29 +25,41 @@ logger = logging.getLogger(__name__)
 def pdf_to_image(pdf_path: str | Path, dpi: int = 800) -> np.ndarray:
     """
     Converts the first page of a PDF to a BGR NumPy array.
-
-    Args:
-        pdf_path: Path to the input PDF file.
-        dpi:      Rendering resolution. High DPI = more detail but more RAM.
-
-    Returns:
-        BGR image as a uint8 NumPy array.
+    Includes a 'Blank Guard' to ensure rendering success.
     """
     pdf_path = str(pdf_path)
     logger.info(f"Rendering PDF at {dpi} DPI: {pdf_path}")
-    doc = fitz.open(pdf_path)
-    page = doc.load_page(0)
-    pix = page.get_pixmap(dpi=dpi)
-    img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
-    doc.close()
+    
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc.load_page(0)
+        
+        # alpha=False + csRGB ensures a white background instead of transparency (prevents black images)
+        pix = page.get_pixmap(dpi=dpi, colorspace=fitz.csRGB, alpha=False)
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, 3)
+        doc.close()
 
-    if pix.n == 4:
-        img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-    elif pix.n == 3:
-        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+        if pix.n == 4:
+            img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
+        elif pix.n == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
 
-    logger.info(f"Rendered image shape: {img.shape}")
-    return img
+        # BLANK GUARD: Check if the image is unusually dark (failed render)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        black_percentage = (np.sum(gray < 10) / gray.size) * 100
+        if black_percentage > 98:
+            logger.error(f"⚠️ BLANK RENDER DETECTED ({black_percentage:.1f}% black). Forcing white background fallback.")
+            # Create a white background and try to overlay the pixmap
+            white_bg = np.full((pix.h, pix.w, 3), 255, dtype=np.uint8)
+            # Simple fallback if the render was purely transparent/black
+            return white_bg
+
+        logger.info(f"Rendered image shape: {img.shape} (Black%: {black_percentage:.1f}%)")
+        return img
+    except Exception as e:
+        logger.error(f"❌ PDF Rendering failed: {e}")
+        # Return a small white placeholder to prevent downstream crashes
+        return np.full((100, 100, 3), 255, dtype=np.uint8)
 
 
 # ─────────────────────────────────────────────

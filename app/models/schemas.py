@@ -39,10 +39,13 @@ class DetectedObject(BaseModel):
 
 
 class Callout(BaseModel):
-    loc: tuple[int, int] = Field(..., description="(x, y) position in tile-local pixels")
-    text: str = Field(..., description="Short callout label, e.g. 'A', 'E', 'REMOVE SPLITTER'")
-    desc: str = Field(default="", description="Human-readable description of the callout")
+    gx: Optional[float] = Field(None, description="Global X coordinate")
+    gy: Optional[float] = Field(None, description="Global Y coordinate")
+    loc: Optional[tuple[int, int]] = Field(None, description="(x, y) position in tile-local pixels")
+    text: str = Field(..., description="Short callout label")
+    desc: str = Field(default="", description="Human-readable description")
     model: str = Field(default="", description="Model that triggered the callout")
+    type: str = Field(default="NORMAL", description="FLAGGED or NORMAL")
 
 
 # ─────────────────────────────────────────────
