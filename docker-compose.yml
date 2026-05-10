@@ -1,0 +1,112 @@
+# docker-compose.yml
+# ─────────────────────────────────────────────────────────────────────
+# Telecom Vision API — Full production stack
+#
+# Services:
+#   redis     — message broker + result backend + job store
+#   api       — FastAPI server (reads/writes job state to Redis)
+#   worker    — Celery worker (heavy GPU inference, isolated process)
+#   flower    — Celery monitoring dashboard (http://localhost:5555)
+#
+# Usage:
+#   docker compose up --build
+#
+# GPU workers:
+#   docker compose up --scale worker=4
+# ─────────────────────────────────────────────────────────────────────
+
+
+
+services:
+
+  # ── Redis ────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes   # persist data to disk
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ── FastAPI ──────────────────────────────────────────────────────────
+  api:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      # EasyOCR needs a writable path for models inside the container
+      EASYOCR_MODULE_PATH: /app/.EasyOCR
+    volumes:
+      - storage_data:/app/storage
+      - ./model_weights:/app/model_weights:ro     # read-only model mount
+    depends_on:
+      redis:
+        condition: service_healthy
+    # Standard healthcheck to ensure the API is ready to accept requests
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2
+
+  # ── Celery Worker ────────────────────────────────────────────────────
+  worker:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      EASYOCR_MODULE_PATH: /app/.EasyOCR
+    volumes:
+      - storage_data:/app/storage
+      - ./model_weights:/app/model_weights:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A app.workers.celery_app worker
+        --loglevel=info
+        --concurrency=2
+        --queues=celery
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ── Flower (Task Monitor) ────────────────────────────────────────────
+  flower:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "5555:5555"
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      EASYOCR_MODULE_PATH: /app/.EasyOCR
+    depends_on:
+      - redis
+      - worker
+    command: >
+      celery -A app.workers.celery_app --broker=redis://redis:6379/0 flower
+        --port=5555
+
+volumes:
+  redis_data:
+  storage_data:

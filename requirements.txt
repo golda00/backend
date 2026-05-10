@@ -37,4 +37,4 @@ psutil>=5.9.0                  # memory usage monitoring in perf stats
 # ──────────────────────────────────────────────
 redis>=5.0.0                   # async Redis client (redis.asyncio) + sync client for Celery tasks
 celery>=5.4.0                  # distributed task queue
-
+flower>=2.0.0                  # celery monitoring dashboard
