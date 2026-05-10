@@ -214,7 +214,7 @@ def run_fiber_after_pipeline(job_id: str, store: Any, settings: Settings):
             img_np = np.array(img_after)
             doc.close()
 
-            engine = FiberAfterEngine(str(settings.MODELS_DIR / "fiber_best.pt"))
+            engine = FiberAfterEngine(str(settings._resolve_model("fiber_best.pt")))
             text_elements = engine.extract_text(pdf_path, zoom)
             
             _sync_update({"progress": 30.0, "message": "Running AI object detection..."})

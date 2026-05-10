@@ -27,25 +27,39 @@ class Settings(BaseSettings):
     # --- Model Weights ---
     MODELS_DIR: Path = BASE_DIR / "model_weights"
 
+    def _resolve_model(self, filename: str) -> Path:
+        """
+        Safely resolves a model path. 
+        If the specific model file (e.g. 'fiber_node_model.pt') is missing, 
+        it falls back to 'best.pt' to prevent FileNotFoundError crashes.
+        """
+        path = self.MODELS_DIR / filename
+        if not path.exists():
+            fallback = self.MODELS_DIR / "best.pt"
+            if fallback.exists():
+                logger.info(f"⚠️ Model {filename} not found, falling back to {fallback.name}")
+                return fallback
+        return path
+
     @property
     def MAIN_MODEL_PATH(self) -> Path:
-        return self.MODELS_DIR / "best.pt"
+        return self._resolve_model("best.pt")
 
     @property
     def PS_MODEL_PATH(self) -> Path:
-        return self.MODELS_DIR / "power_supply_best.pt"
+        return self._resolve_model("power_supply_best.pt")
 
     @property
     def NODE_MODEL_PATH(self) -> Path:
-        return self.MODELS_DIR / "3x3_4x4_new_model.pt"
+        return self._resolve_model("3x3_4x4_new_model.pt")
 
     @property
     def INTERNAL_MODEL_PATH(self) -> Path:
-        return self.MODELS_DIR / "Internal_best.pt"
+        return self._resolve_model("Internal_best.pt")
 
     @property
     def FIBER_NODE_MODEL_PATH(self) -> Path:
-        return self.MODELS_DIR / "fiber_node_model.pt"
+        return self._resolve_model("fiber_node_model.pt")
 
     # --- Storage ---
     STORAGE_DIR: Path = BASE_DIR / "storage"

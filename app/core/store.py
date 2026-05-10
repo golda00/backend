@@ -178,6 +178,18 @@ class PersistentJobStore(InMemoryJobStore):
         except Exception as e:
             logger.warning(f"⚠️ Failed to save persistent jobs: {e}")
 
+    async def get(self, job_id: str) -> dict | None:
+        """
+        Retrieves a job. If not found in memory, it reloads from the disk.
+        This is critical for multi-worker setups (e.g. --workers 2) where 
+        Process A might create a job that Process B doesn't know about yet.
+        """
+        val = await super().get(job_id)
+        if val is None:
+            self._load()
+            val = await super().get(job_id)
+        return val
+
     async def set(self, job_id: str, data: dict, ttl: int | None = None) -> None:
         await super().set(job_id, data, ttl)
         self._save()

@@ -47,8 +47,11 @@ def _pdf_to_bgr(p, dpi=300):
 # 1. COAX PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_pipeline_sync(job_id, job_store, settings, **kwargs):
-    detector = kwargs.get("detector") or kwargs.get("processor")
+def run_pipeline_sync(job_id, job_store, settings, detector=None, **kwargs):
+    detector = detector or kwargs.get("detector") or kwargs.get("processor")
+    if detector is None:
+        from app.workers.tasks import _get_detector
+        detector = _get_detector(settings)
 
     def _update(s, p, m):
         if job_id not in job_store:
@@ -245,13 +248,16 @@ def run_pipeline_sync(job_id, job_store, settings, **kwargs):
 # 2. FIBER OVERVIEW PIPELINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_fiber_overview_pipeline(job_id, job_store, settings, **kwargs):
+def run_fiber_overview_pipeline(job_id, job_store, settings, processor=None, **kwargs):
     """
     Runs node + cable detection on the Fiber Overview map,
     builds callout records from node / splice-can results,
     and renders them via generate_final_report.
     """
-    processor: FiberOverviewProcessor = kwargs.get("processor")
+    processor = processor or kwargs.get("processor")
+    if processor is None:
+        from app.workers.tasks import _get_overview_processor
+        processor = _get_overview_processor(settings)
 
     def _update(s, p, m):
         job_store[job_id].update({"status": s, "progress": p, "message": m})
