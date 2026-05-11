@@ -193,14 +193,29 @@ def run_fiber_after_pipeline(job_id: str, store: Any, settings: Settings):
         def _sync_update(data: dict):
             if "message" in data:
                 logger.info(f"[{job_id}] [{data.get('progress', 0.0):.0f}%] {data['message']}")
+            
+            # Update the local job dict
             job.update(data)
+            
             # Handle both Store object (Celery) and dict stub (Local threading)
             if hasattr(store, 'set_sync'):
                 store.set_sync(job_id, job)
             elif isinstance(store, dict):
-                store[job_id] = job
+                # If store[job_id] is a proxy, calling .update() on it triggers sync
+                target = store.get(job_id)
+                if hasattr(target, 'update') and target is not job:
+                    target.update(data)
+                elif target is job and hasattr(job, 'update'):
+                    # job is already the proxy, and we updated it above via job.update(data)
+                    # if it's a _RedisSyncProxy, it already triggered _sync_update_job
+                    pass
+                else:
+                    store[job_id] = job
             else:
-                loop.run_until_complete(store.update(job_id, data))
+                try:
+                    loop.run_until_complete(store.update(job_id, data))
+                except Exception as e:
+                    logger.warning(f"Async update failed: {e}")
 
         # ─── PHASE 1: DETECTION ──────────────────────────────────────────────
         if status in [JobStatus.QUEUED, JobStatus.PROCESSING]:
@@ -289,20 +304,21 @@ def run_fiber_after_pipeline(job_id: str, store: Any, settings: Settings):
 
                 flagged_tiles.append(tile_idx)
 
-            # Store detection state
-            # Store detection state
+            # Store detection state and HALT for review
             _sync_update({
+                "status": JobStatus.AWAITING_REVIEW,
                 "progress": 82.0,
-                "message": "Detection finished. Starting report rendering...",
+                "message": "AI detection complete. Please review the results.",
                 "all_callout_records": all_callout_records,
                 "flagged_tiles": flagged_tiles,
                 "tile_offsets_fiber": {i: (max(0, int((r["bbox"][0]+r["bbox"][2])/2 - 320)), max(0, int((r["bbox"][1]+r["bbox"][3])/2 - 320))) for i, r in enumerate(results)},
                 "pdf_path": Path(pdf_path).resolve().as_posix(),
             })
+            return  # HALT HERE for user review
 
         # ─── PHASE 2: REPORTING ──────────────────────────────────────────────
-        # Proceed automatically if we just finished Detection, or if resumed in reporting mode
-        if status in [JobStatus.QUEUED, JobStatus.PROCESSING, JobStatus.REPORTING]:
+        # Proceed ONLY if status is REPORTING (set by jobs.py after user hits Proceed)
+        if status == JobStatus.REPORTING:
             _sync_update({"progress": 85.0, "message": "Finalizing annotated report..."})
             
             pdf_path = job["pdf_path"]

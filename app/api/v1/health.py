@@ -21,8 +21,10 @@ async def health_check(
 ) -> HealthResponse:
     # Check if the detector was successfully loaded at startup
     detector_loaded = hasattr(request.app.state, "detector") and request.app.state.detector is not None
+    job_store_type = getattr(request.app.state, "job_store_type", "unknown")
     return HealthResponse(
         status="ok",
         version=settings.APP_VERSION,
         models_loaded=detector_loaded,
+        job_store_type=job_store_type,
     )

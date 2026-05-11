@@ -84,6 +84,7 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     version: str
     models_loaded: bool
+    job_store_type: str = "unknown"
 
 
 class JobActionRequest(BaseModel):

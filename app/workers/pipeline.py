@@ -79,29 +79,28 @@ def run_pipeline_sync(job_id, job_store, settings, detector=None, **kwargs):
             # ── Save sample tiles for DPI confirmation preview ────────────────
             # The frontend shows tiles/{before|after}/before_N.png & after_N.png
             tile_size = 640
-            h, w = fa.shape[:2]
-            # Pick 3 evenly spaced tile origins that contain map content
             sample_indices = []
-            step_x, step_y = w // 4, h // 4
-            candidates = [
-                (step_x, step_y), (step_x * 2, step_y * 2), (step_x * 3, step_y), (step_x * 2, step_y)
-            ]
-            for s_num, (tx, ty) in enumerate(candidates, start=1):
-                tx = max(0, min(tx, w - tile_size))
-                ty = max(0, min(ty, h - tile_size))
+            
+            td_before = out / "tiles" / "before"
+            td_after  = out / "tiles" / "after"
+            td_before.mkdir(parents=True, exist_ok=True)
+            td_after.mkdir(parents=True, exist_ok=True)
+
+            # Save ALL tiles for comprehensive review
+            for t in iter_tiles(fa, tile_size, 0.1):
+                s_num = t["index"]
+                tx, ty = t["x"], t["y"]
+                
+                # Extract tiles from both maps at the same coordinates
                 before_tile = fb[ty:ty+tile_size, tx:tx+tile_size]
-                after_tile  = fa[ty:ty+tile_size, tx:tx+tile_size]
-                # Skip tiles that are >90% white (empty canvas edge)
-                bt_gray = cv2.cvtColor(before_tile, cv2.COLOR_BGR2GRAY)
-                if (np.sum(bt_gray > 245) / bt_gray.size) > 0.90:
-                    continue
-                td_before = out / "tiles" / "before"
-                td_after  = out / "tiles" / "after"
-                td_before.mkdir(parents=True, exist_ok=True)
-                td_after.mkdir(parents=True, exist_ok=True)
+                after_tile  = t["tile"] # fa[ty:ty+tile_size, tx:tx+tile_size]
+                
                 cv2.imwrite(str(td_before / f"before_{s_num}.png"), before_tile)
                 cv2.imwrite(str(td_after  / f"after_{s_num}.png"),  after_tile)
                 sample_indices.append(s_num)
+                
+                if s_num % 10 == 0:
+                    logger.info(f"[{job_id}] Saved sample tile pair {s_num}")
 
             if not sample_indices:
                 # Fallback: save top-left tile unconditionally
@@ -111,6 +110,7 @@ def run_pipeline_sync(job_id, job_store, settings, detector=None, **kwargs):
                 td_after.mkdir(parents=True, exist_ok=True)
                 cv2.imwrite(str(td_before / "before_1.png"), fb[:tile_size, :tile_size])
                 cv2.imwrite(str(td_after  / "after_1.png"),  fa[:tile_size, :tile_size])
+                logger.info(f"[{job_id}] Saved fallback sample tile pair (1)")
                 sample_indices = [1]
 
             job_store[job_id].update({
@@ -231,6 +231,7 @@ def run_pipeline_sync(job_id, job_store, settings, detector=None, **kwargs):
                 },
                 title_font_size=24,
             )
+            logger.info(f"[{job_id}] Final report saved to: {out / 'report.pdf'}")
             job_store[job_id].update({
                 "status":      JobStatus.COMPLETED,
                 "progress":    100.0,
@@ -343,6 +344,7 @@ def run_fiber_overview_pipeline(job_id, job_store, settings, processor=None, **k
             },
             title_font_size=14,
         )
+        logger.info(f"[{job_id}] Fiber Overview report saved to: {report_path}")
 
         job_store[job_id].update({
             "status":      JobStatus.COMPLETED,

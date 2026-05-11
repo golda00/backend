@@ -16,6 +16,7 @@ Batch 3 changes:
 """
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 import shutil
@@ -779,7 +780,7 @@ def _write_job_sidecar(job_dir: Path, job_record: dict) -> None:
         return str(obj)
     try:
         sidecar_path = Path(job_dir) / "job_record.json"
-        sidecar_path.write_text(_json.dumps(job_record, default=_default), encoding="utf-8")
+        sidecar_path.write_text(json.dumps(job_record, default=_default), encoding="utf-8")
     except Exception as e:
         logger.warning(f"Could not write job sidecar file: {e}")
 
@@ -797,7 +798,7 @@ def _serialize_for_celery(job_record: dict) -> dict:
         if isinstance(obj, Path):
             return str(obj)
         return str(obj)
-    return _json.loads(_json.dumps(job_record, default=_default))
+    return json.loads(json.dumps(job_record, default=_default))
 
 
 async def _get_job_or_404(request: Request, job_id: str) -> dict:

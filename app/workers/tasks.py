@@ -37,6 +37,28 @@ from app.services.fiber_after import run_fiber_after_pipeline
 logger = logging.getLogger(__name__)
 
 
+class _RedisSyncProxy(dict):
+    """
+    A dict wrapper that triggers a Redis sync on every write.
+    Used by workers to push progress/status updates back to Redis.
+    """
+    def __init__(self, initial: dict, redis_client, job_id: str):
+        super().__init__(initial)
+        self._r = redis_client
+        self._job_id = job_id
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        _sync_update_job(self._r, self._job_id, dict(self))
+
+    def update(self, other=None, **kwargs):
+        if other:
+            super().update(other, **kwargs)
+        else:
+            super().update(**kwargs)
+        _sync_update_job(self._r, self._job_id, dict(self))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Shared helper: load job with Redis → jobs.json fallback
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,16 +140,6 @@ def run_fiber_overview_task(self, job_id: str, job_data: dict | None = None) -> 
     settings = get_settings()
     r = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
-    class _RedisSyncProxy(dict):
-        def __init__(self, initial: dict):
-            super().__init__(initial)
-        def __setitem__(self, key, value):
-            super().__setitem__(key, value)
-        def update(self, other=None, **kwargs):
-            if other: super().update(other, **kwargs)
-            else: super().update(**kwargs)
-            _sync_update_job(r, job_id, dict(self))
-
     # Try provided data first, then fallback
     initial_data = job_data or _load_job_with_fallback(r, job_id, settings)
     
@@ -142,7 +154,7 @@ def run_fiber_overview_task(self, job_id: str, job_data: dict | None = None) -> 
             logger.info(f"[task] Backfilled Redis for {job_id!r} using job_data from message.")
         except Exception: pass
 
-    proxy_store = {job_id: _RedisSyncProxy(initial_data)}
+    proxy_store = {job_id: _RedisSyncProxy(initial_data, r, job_id)}
 
     logger.info(f"[{job_id}] 🚀 Fiber Overview task started.")
     try:
@@ -178,16 +190,6 @@ def run_fiber_before_task(self, job_id: str, job_data: dict | None = None) -> di
     settings = get_settings()
     r = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
-    class _RedisSyncProxy(dict):
-        def __init__(self, initial: dict):
-            super().__init__(initial)
-        def __setitem__(self, key, value):
-            super().__setitem__(key, value)
-        def update(self, other=None, **kwargs):
-            if other: super().update(other, **kwargs)
-            else: super().update(**kwargs)
-            _sync_update_job(r, job_id, dict(self))
-
     initial_data = job_data or _load_job_with_fallback(r, job_id, settings)
     if initial_data is None:
         logger.error(f"[task] Job {job_id!r} not found")
@@ -198,7 +200,7 @@ def run_fiber_before_task(self, job_id: str, job_data: dict | None = None) -> di
             r.set(f"telecom_job:{job_id}", json.dumps(job_data), ex=86400)
         except Exception: pass
 
-    proxy_store = {job_id: _RedisSyncProxy(initial_data)}
+    proxy_store = {job_id: _RedisSyncProxy(initial_data, r, job_id)}
 
     from app.services.fiber_before import run_fiber_before_pipeline
 
@@ -234,16 +236,6 @@ def run_coax_before_task(self, job_id: str, job_data: dict | None = None) -> dic
     settings = get_settings()
     r = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
-    class _RedisSyncProxy(dict):
-        def __init__(self, initial: dict):
-            super().__init__(initial)
-        def __setitem__(self, key, value):
-            super().__setitem__(key, value)
-        def update(self, other=None, **kwargs):
-            if other: super().update(other, **kwargs)
-            else: super().update(**kwargs)
-            _sync_update_job(r, job_id, dict(self))
-
     initial_data = job_data or _load_job_with_fallback(r, job_id, settings)
     if initial_data is None:
         logger.error(f"[task] Job {job_id!r} not found")
@@ -254,7 +246,7 @@ def run_coax_before_task(self, job_id: str, job_data: dict | None = None) -> dic
             r.set(f"telecom_job:{job_id}", json.dumps(job_data), ex=86400)
         except Exception: pass
 
-    proxy_store = {job_id: _RedisSyncProxy(initial_data)}
+    proxy_store = {job_id: _RedisSyncProxy(initial_data, r, job_id)}
 
     from app.services.coax_before import run_coax_before_pipeline
 
@@ -288,16 +280,6 @@ def run_fiber_after_task(self, job_id: str, job_data: dict | None = None) -> dic
     settings = get_settings()
     r = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
-    class _RedisSyncProxy(dict):
-        def __init__(self, initial: dict):
-            super().__init__(initial)
-        def __setitem__(self, key, value):
-            super().__setitem__(key, value)
-        def update(self, other=None, **kwargs):
-            if other: super().update(other, **kwargs)
-            else: super().update(**kwargs)
-            _sync_update_job(r, job_id, dict(self))
-
     initial_data = job_data or _load_job_with_fallback(r, job_id, settings)
     if initial_data is None:
         logger.error(f"[task] Job {job_id!r} not found")
@@ -308,7 +290,7 @@ def run_fiber_after_task(self, job_id: str, job_data: dict | None = None) -> dic
             r.set(f"telecom_job:{job_id}", json.dumps(job_data), ex=86400)
         except Exception: pass
 
-    proxy_store = {job_id: _RedisSyncProxy(initial_data)}
+    proxy_store = {job_id: _RedisSyncProxy(initial_data, r, job_id)}
 
     try:
         run_fiber_after_pipeline(
@@ -390,20 +372,6 @@ def run_pipeline_task(self, job_id: str, job_data: dict | None = None) -> dict:
     # ── Connect to Redis (sync client inside Celery worker) ──────────
     r = redis.from_url(settings.REDIS_URL, decode_responses=True)
 
-    class _RedisSyncProxy(dict):
-        def __init__(self, initial: dict):
-            super().__init__(initial)
-
-        def __setitem__(self, key, value):
-            super().__setitem__(key, value)
-
-        def update(self, other=None, **kwargs):
-            if other:
-                super().update(other, **kwargs)
-            else:
-                super().update(**kwargs)
-            _sync_update_job(r, job_id, dict(self))
-
     initial_data = job_data or _load_job_with_fallback(r, job_id, settings)
     if initial_data is None:
         logger.error(f"[task] Job {job_id!r} not found — aborting.")
@@ -414,7 +382,7 @@ def run_pipeline_task(self, job_id: str, job_data: dict | None = None) -> dict:
             r.set(f"telecom_job:{job_id}", json.dumps(job_data), ex=86400)
         except Exception: pass
 
-    proxy_store = {job_id: _RedisSyncProxy(initial_data)}
+    proxy_store = {job_id: _RedisSyncProxy(initial_data, r, job_id)}
 
     logger.info(f"[{job_id}] 🚀 Main Coax/Fiber task started.")
     try:

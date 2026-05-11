@@ -2,9 +2,13 @@
 Central application configuration.
 All settings are loaded from environment variables or a .env file.
 """
+import logging
 from pathlib import Path
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+logger = logging.getLogger(__name__)
 
 
 # Base directory of this file -> project root
