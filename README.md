@@ -2,7 +2,7 @@
 
 > An AI-powered backend service for automated analysis of Telecom network maps (Coax & Fiber). It compares Before/After maps, detects infrastructure changes using computer vision, generates annotated PDF reports with callouts, and stamps Survey information onto maps — all served through a clean REST API.
 
----
+----
 
 ## 📌 Table of Contents
 - [What This Project Does](#-what-this-project-does)
